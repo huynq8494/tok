@@ -2,28 +2,39 @@
 
 set -euo pipefail
 
-DIR=${PWD}
-
-usage() {
-    cat <<EOF
-Usage:
-
-Create/Insert:
-  $0 -p <dir> -i <index> -n <name>
-
-Update:
-  $0 -p <dir> -i <index> -u <file_name>
-
-Delete:
-  $0 -p <dir> -d <file_name>
-EOF
-    exit 1
-}
-
+DIR="$PWD"
 INDEX=""
 NAME=""
 UPDATE_FILE=""
 DELETE_FILE=""
+
+usage() {
+cat <<EOF
+Usage:
+
+Create:
+  $0 -p <dir> -i <index> -n <file_name>
+
+Update / Move:
+  $0 -p <dir> -i <index> -u <file_name>
+
+Delete:
+  $0 -p <dir> -d <file_name>
+
+Examples:
+
+  $0 -p . -i 2 -n yolo.py
+
+  $0 -p . -i 1 -u yolo.py
+
+  $0 -p . -d yolo.py
+EOF
+exit 1
+}
+
+###############################################################################
+# argument parsing
+###############################################################################
 
 while getopts "p:i:n:u:d:" opt; do
     case "$opt" in
@@ -36,84 +47,130 @@ while getopts "p:i:n:u:d:" opt; do
     esac
 done
 
-[[ -d "$DIR" ]] || { echo "Directory not found: $DIR"; exit 1; }
-
-###############################################################################
-# Helpers
-###############################################################################
-
-get_index() {
-    local f
-    f=$(basename "$1")
-    [[ "$f" =~ ^([0-9]+)_(.+)$ ]] || return 1
-    echo "${BASH_REMATCH[1]}"
+[[ -d "$DIR" ]] || {
+    echo "Directory not found: $DIR"
+    exit 1
 }
 
-get_name() {
-    local f
-    f=$(basename "$1")
-    [[ "$f" =~ ^([0-9]+)_(.+)$ ]] || return 1
-    echo "${BASH_REMATCH[2]}"
+###############################################################################
+# helpers
+###############################################################################
+
+validate_index() {
+    [[ "$1" =~ ^[0-9]+$ ]] || {
+        echo "Invalid index: $1"
+        exit 1
+    }
+
+    (( $1 > 0 )) || {
+        echo "Index must be greater than 0"
+        exit 1
+    }
+}
+
+list_files_asc() {
+    find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
+        grep -E '^[0-9]+_' |
+        sort -t_ -k1,1n || true
+}
+
+list_files_desc() {
+    find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
+        grep -E '^[0-9]+_' |
+        sort -t_ -k1,1nr || true
+}
+
+find_target() {
+    local name="$1"
+
+    if [[ -f "$DIR/$name" ]]; then
+        echo "$DIR/$name"
+        return
+    fi
+
+    find "$DIR" -maxdepth 1 -type f \
+        -name "*_${name}" | head -n 1
+}
+
+parse_file() {
+    local file
+    file=$(basename "$1")
+
+    FILE_INDEX=""
+    FILE_NAME="$file"
+    FILE_INDEXED=false
+
+    if [[ "$file" =~ ^([0-9]+)_(.+)$ ]]; then
+        FILE_INDEX="${BASH_REMATCH[1]}"
+        FILE_NAME="${BASH_REMATCH[2]}"
+        FILE_INDEXED=true
+    fi
 }
 
 shift_up_from() {
     local start="$1"
 
-    find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
-        grep -E '^[0-9]+_' |
-        sort -t_ -k1,1nr |
-        while read -r file; do
+    while read -r file; do
+        [[ -z "$file" ]] && continue
 
-            idx="${file%%_*}"
-            rest="${file#*_}"
+        local idx="${file%%_*}"
+        local name="${file#*_}"
 
-            if (( idx >= start )); then
-                mv "$DIR/$file" "$DIR/$((idx + 1))_$rest"
-            fi
-        done
+        if (( idx >= start )); then
+            mv "$DIR/$file" "$DIR/$((idx+1))_$name"
+        fi
+    done < <(list_files_desc)
 }
 
 shift_down_from() {
     local start="$1"
 
-    find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
-        grep -E '^[0-9]+_' |
-        sort -t_ -k1,1n |
-        while read -r file; do
+    while read -r file; do
+        [[ -z "$file" ]] && continue
 
-            idx="${file%%_*}"
-            rest="${file#*_}"
+        local idx="${file%%_*}"
+        local name="${file#*_}"
 
-            if (( idx > start )); then
-                mv "$DIR/$file" "$DIR/$((idx - 1))_$rest"
-            fi
-        done
+        if (( idx > start )); then
+            mv "$DIR/$file" "$DIR/$((idx-1))_$name"
+        fi
+    done < <(list_files_asc)
 }
 
 ###############################################################################
-# DELETE
+# delete index from file
 ###############################################################################
 
 if [[ -n "$DELETE_FILE" ]]; then
 
-    TARGET=$(find "$DIR" -maxdepth 1 -type f -name "*_${DELETE_FILE}" | head -n 1)
+    TARGET=$(find_target "$DELETE_FILE")
 
     [[ -n "$TARGET" ]] || {
-        echo "File not found: $DELETE_FILE"
+        echo "Indexed file not found: $DELETE_FILE"
         exit 1
     }
 
-    OLD_INDEX=$(get_index "$TARGET")
+    parse_file "$TARGET"
 
-    rm -f "$TARGET"
+    if ! $FILE_INDEXED; then
+        echo "File is already unindexed: $DELETE_FILE"
+        exit 0
+    fi
+
+    OLD_INDEX="$FILE_INDEX"
+    REAL_NAME="$FILE_NAME"
+
+    mv "$TARGET" "$DIR/$REAL_NAME"
 
     shift_down_from "$OLD_INDEX"
+
+    echo "Removed index from: ${OLD_INDEX}_${REAL_NAME}"
 
     exit 0
 fi
 
 ###############################################################################
-# CREATE
+# create
 ###############################################################################
 
 if [[ -n "$NAME" ]]; then
@@ -123,19 +180,28 @@ if [[ -n "$NAME" ]]; then
         exit 1
     }
 
-    EXISTS=$(find "$DIR" -maxdepth 1 -type f -name "${INDEX}_*" | head -n 1)
+    validate_index "$INDEX"
 
-    if [[ -n "$EXISTS" ]]; then
+    if find "$DIR" -maxdepth 1 -type f \
+        -name "${INDEX}_*" | grep -q .; then
         shift_up_from "$INDEX"
     fi
 
-    touch "$DIR/${INDEX}_${NAME}"
+    NEW_FILE="$DIR/${INDEX}_${NAME}"
 
+    [[ ! -e "$NEW_FILE" ]] || {
+        echo "File already exists: $(basename "$NEW_FILE")"
+        exit 1
+    }
+
+    touch "$NEW_FILE"
+
+    echo "Created: $(basename "$NEW_FILE")"
     exit 0
 fi
 
 ###############################################################################
-# UPDATE
+# update
 ###############################################################################
 
 if [[ -n "$UPDATE_FILE" ]]; then
@@ -145,59 +211,83 @@ if [[ -n "$UPDATE_FILE" ]]; then
         exit 1
     }
 
-    TARGET=$(find "$DIR" -maxdepth 1 -type f -name "*_${UPDATE_FILE}" | head -n 1)
+    validate_index "$INDEX"
+
+    TARGET=$(find_target "$UPDATE_FILE")
 
     [[ -n "$TARGET" ]] || {
         echo "File not found: $UPDATE_FILE"
         exit 1
     }
 
-    OLD_INDEX=$(get_index "$TARGET")
+    parse_file "$TARGET"
 
-    if (( INDEX == OLD_INDEX )); then
+    REAL_NAME="$FILE_NAME"
+
+    #
+    # Plain file (yolo.py)
+    #
+    if ! $FILE_INDEXED; then
+
+        shift_up_from "$INDEX"
+
+        mv "$TARGET" "$DIR/${INDEX}_${REAL_NAME}"
+
+        echo "Moved: ${REAL_NAME} -> ${INDEX}_${REAL_NAME}"
         exit 0
     fi
 
-    BASE_NAME=$(basename "$TARGET")
-    REAL_NAME="${BASE_NAME#*_}"
+    OLD_INDEX="$FILE_INDEX"
 
-    TMP_FILE="$DIR/.tmp.$$.$REAL_NAME"
+    #
+    # Nothing to do
+    #
+    if (( INDEX == OLD_INDEX )); then
+        echo "No changes"
+        exit 0
+    fi
+
+    TMP_FILE=$(mktemp "$DIR/.reindex.XXXXXX")
 
     mv "$TARGET" "$TMP_FILE"
 
+    #
+    # Move toward beginning
+    #
     if (( INDEX < OLD_INDEX )); then
 
-        find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
-            grep -E '^[0-9]+_' |
-            sort -t_ -k1,1nr |
-            while read -r file; do
+        while read -r file; do
+            [[ -z "$file" ]] && continue
 
-                idx="${file%%_*}"
-                rest="${file#*_}"
+            idx="${file%%_*}"
+            name="${file#*_}"
 
-                if (( idx >= INDEX && idx < OLD_INDEX )); then
-                    mv "$DIR/$file" "$DIR/$((idx + 1))_$rest"
-                fi
-            done
+            if (( idx >= INDEX && idx < OLD_INDEX )); then
+                mv "$DIR/$file" "$DIR/$((idx+1))_$name"
+            fi
+        done < <(list_files_desc)
 
+    #
+    # Move toward end
+    #
     else
 
-        find "$DIR" -maxdepth 1 -type f -printf "%f\n" |
-            grep -E '^[0-9]+_' |
-            sort -t_ -k1,1n |
-            while read -r file; do
+        while read -r file; do
+            [[ -z "$file" ]] && continue
 
-                idx="${file%%_*}"
-                rest="${file#*_}"
+            idx="${file%%_*}"
+            name="${file#*_}"
 
-                if (( idx > OLD_INDEX && idx <= INDEX )); then
-                    mv "$DIR/$file" "$DIR/$((idx - 1))_$rest"
-                fi
-            done
+            if (( idx > OLD_INDEX && idx <= INDEX )); then
+                mv "$DIR/$file" "$DIR/$((idx-1))_$name"
+            fi
+        done < <(list_files_asc)
+
     fi
 
     mv "$TMP_FILE" "$DIR/${INDEX}_${REAL_NAME}"
 
+    echo "Moved: ${OLD_INDEX}_${REAL_NAME} -> ${INDEX}_${REAL_NAME}"
     exit 0
 fi
 
